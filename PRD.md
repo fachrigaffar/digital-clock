@@ -1,258 +1,188 @@
-# Product Requirement Document (PRD)
-## Proyek UAS: Smart Digital Clock & Alarm IoT (WhatsApp Integrated)
+# PRD: Kontrol Smart Clock via WhatsApp (WWebJS Bridge)
 
-> **Catatan untuk AI Code Assistant (Claude Code / Cursor / Codex):**
-> Dokumen ini adalah single source of truth untuk dua codebase yang saling terhubung:
-> 1. **Firmware ESP32** (C++, Arduino Framework / PlatformIO)
-> 2. **WhatsApp Gateway Server** (Node.js, `wwebjs.dev` + MQTT client)
->
-> Kedua sisi WAJIB mengikuti kontrak topic & payload MQTT di Bagian 6 agar tidak terjadi mismatch. Jika ada ambiguitas, prioritaskan konsistensi terhadap tabel pin di Bagian 3 (hardware, TIDAK berubah) dan kontrak MQTT di Bagian 6 — jangan berasumsi nama topic/payload baru tanpa konfirmasi.
->
-> **Perubahan arsitektur:** Komunikasi ESP32 ↔ Gateway dipindah dari REST polling ke **MQTT (publish/subscribe)**. Ini murni perubahan software (firmware + gateway) — tidak ada perubahan wiring, pin, atau komponen hardware dari versi sebelumnya.
+**Dokumen:** Product Requirements Document
+**Produk:** Smart Clock (ESP32 Gas Alarm + Alarm Jam + Pomodoro)
+**Fitur baru:** Kontrol & notifikasi via WhatsApp
+**Status:** Draft
+**Versi:** 0.1
 
 ---
 
-## 1. Ringkasan Proyek
+## 1. Latar Belakang
 
-Sistem ini merupakan jam digital berbasis IoT yang dilengkapi dengan fitur alarm, sensor kebocoran gas/asap, layar informasi OLED, serta interaksi dua arah menggunakan WhatsApp Bot melalui Cloudflare Tunnel. Sirkuit diimplementasikan menggunakan PCB Polos hasil cetak mandiri (CNC Router) dengan tambahan 8 buah LED dekorasi yang dikendalikan secara efisien oleh IC Shift Register 74LS164.
+Smart Clock saat ini adalah perangkat ESP32 dengan:
+- Sensor gas (MQ series) dengan alarm buzzer otomatis saat level gas melewati ambang batas
+- Alarm jam manual (set/edit/hapus via OLED + 3 push button)
+- Timer Pomodoro
+- OLED 128x32 sebagai antarmuka utama
+- Koneksi WiFi (via WiFiManager) dan MQTT (TLS, port 8883) untuk publish status & menerima command
 
-ESP32 dilengkapi **WiFiManager** (captive portal) sehingga kredensial WiFi tidak di-hardcode di source code — memudahkan pergantian jaringan WiFi di kemudian hari tanpa perlu re-flash firmware.
+Saat ini kontrol jarak jauh hanya bisa lewat MQTT client/dashboard (mis. MQTT Explorer, Node-RED, dsb), yang kurang praktis untuk pemakaian sehari-hari. Tujuan fitur baru ini adalah memungkinkan user **mengontrol dan menerima notifikasi Smart Clock langsung dari WhatsApp**, tanpa perlu membuka aplikasi/dashboard terpisah.
 
-Komunikasi antara ESP32 dan WhatsApp Gateway menggunakan protokol **MQTT** (publish/subscribe) melalui broker MQTT cloud pihak ketiga, sehingga ESP32 tetap **outbound-only** (aman di belakang NAT rumah tanpa perlu Cloudflare Tunnel tambahan) dan mendukung komunikasi near-real-time dua arah.
+## 2. Tujuan (Goals)
 
----
+1. User bisa mengatur alarm, memulai/menghentikan Pomodoro, dan mengecek status perangkat (WiFi, gas, alarm) lewat chat WhatsApp.
+2. User menerima **notifikasi otomatis** ke WhatsApp saat kejadian penting: gas bocor terdeteksi, alarm jam berbunyi, Pomodoro selesai.
+3. Fase awal berjalan sepenuhnya lokal (laptop + broker MQTT lokal), tanpa dependensi cloud, agar mudah dikembangkan & diuji.
+4. Arsitektur dirancang agar broker MQTT lokal bisa diganti ke MQTT cloud/online di kemudian hari **tanpa mengubah kode firmware ESP32 maupun logika command WhatsApp** — hanya konfigurasi host/port/kredensial yang berubah.
 
-## 2. Kebutuhan Perangkat Keras & Komponen
+## 3. Non-Goals (Di Luar Cakupan Fase Ini)
 
-* **Mikrokontroler:** ESP32 WROOM (30 Pin/38 Pin NodeMCU layout)
-* **Logika Perluasan Output:** IC SN74LS164N (14-Pin DIP Package)
-* **Display:** Layar OLED 0.96 inch I2C (SSD1306)
-* **Sensor:** Sensor Gas/Asap MQ Series (Analog Output)
-* **Indikator Suara:** Active Buzzer 5V
-* **Input Fisik:** 3x Push Button (menggunakan internal `INPUT_PULLUP`)
-* **Dekorasi:** 8x LED Standard + 1x Resistor Metal Film 1k Ohm (Common Cathode Ground)
-* **Reset WiFi Manual (baru):** Kombinasi tombol existing (long-press Push Button 3 di GPIO 14 selama ≥3 detik) digunakan untuk trigger `wifiManager.resetSettings()` — tidak perlu tombol fisik tambahan.
+- Tidak membangun UI web/dashboard terpisah (WhatsApp adalah satu-satunya antarmuka jarak jauh untuk fase ini).
+- Tidak mendukung multi-user/multi-device dari awal — asumsikan satu nomor WhatsApp admin per perangkat di fase 1.
+- Tidak menangani autentikasi WhatsApp Business API resmi (Meta Cloud API) — fase ini pakai `whatsapp-web.js` (wwebjs) yang meniru sesi WhatsApp Web biasa.
+- Tidak menjamin uptime 24/7 di fase lokal, karena bridge berjalan di laptop (mati kalau laptop mati/tidur).
 
----
+## 4. Pengguna & Use Case
 
-## 3. Peta Wiring & Koneksi Pin Definitif (Anti-Salah)
+**Persona:** Pemilik perangkat (single user), mengontrol Smart Clock dari HP-nya sendiri via WhatsApp, baik saat di rumah maupun (nanti, di fase cloud) saat di luar.
 
-### A. Tabel Sisi Kiri ESP32
+**Use case utama:**
+1. "Set alarm jam 6 pagi" → alarm tersimpan di perangkat, konfirmasi dibalas ke WhatsApp.
+2. "Mulai pomodoro 25 menit" → timer dimulai, notifikasi dikirim saat selesai.
+3. "Cek status" → dibalas ringkasan: level gas, status WiFi/MQTT, alarm aktif, sisa waktu pomodoro.
+4. Gas bocor terdeteksi → tanpa diminta, sistem langsung push notifikasi WhatsApp "⚠️ Gas bocor terdeteksi! Level: 512".
+5. "Matikan alarm" / "Hapus alarm" / "Batal pomodoro" → aksi langsung dieksekusi di perangkat.
 
-| Pin ESP32 | Jenis Pin | Terhubung ke Komponen | Keterangan Fungsi |
-| :--- | :--- | :--- | :--- |
-| **3V3** | Power Output | VCC Layar OLED | Suplai daya logika OLED |
-| **GND** | Ground Bus | GND Bersama (OLED, Tombol, Sensor, Buzzer, IC) | Jalur balik daya utama |
-| **GPIO 34 (VP)** | Analog In | Pin AOUT Sensor MQ | Membaca kadar gas/asap |
-| **GPIO 25** | Digital Out | **Pin 1 & Pin 2 IC 74LS164** | Jalur Serial DATA (A & B digabung) |
-| **GPIO 26** | Digital In | Push Button 1 | Tombol manual Matikan Alarm |
-| **GPIO 27** | Digital Out | Positif (+) Active Buzzer | Pemicu suara alarm |
-| **GPIO 14** | Digital In | Push Button 3 | Tombol menu fungsional + long-press = reset WiFi |
-| **GPIO 12** | Digital In | Push Button 2 | Tombol menu fungsional |
-| **5V / VIN** | Power Input | VCC Sensor MQ, Pin 14 (VCC) IC, Pin 9 (CLR) IC | Suplai utama 5V dari USB |
-
-### B. Tabel Sisi Kanan ESP32
-
-| Pin ESP32 | Jenis Pin | Terhubung ke Komponen | Keterangan Fungsi |
-| :--- | :--- | :--- | :--- |
-| **GPIO 22** | I2C SCL | Pin SCL Layar OLED | Jalur Clock Display |
-| **GPIO 21** | I2C SDA | Pin SDA Layar OLED | Jalur Data Display |
-| **GPIO 18** | Digital Out | **Pin 8 (CLK) IC 74LS164** | Jalur pergeseran sinyal Clock IC |
-
-### C. Pemetaan Kaki IC SN74LS164N (14 Pin) ke 8 LED Dekorasi
-
-| Nomor Pin IC | Nama Pin | Hubungkan ke Mana? | Target Output Fisik |
-| :---: | :--- | :--- | :--- |
-| **1** | A (Data Input 1) | Jumper langsung ke Pin 2 IC | Input Serial |
-| **2** | B (Data Input 2) | Jalur menuju **GPIO 25** ESP32 | Input Serial |
-| **3** | Q0 (Output) | Kaki Anoda (+) LED 1 | LED Dekorasi 1 |
-| **4** | Q1 (Output) | Kaki Anoda (+) LED 2 | LED Dekorasi 2 |
-| **5** | Q2 (Output) | Kaki Anoda (+) LED 3 | LED Dekorasi 3 |
-| **6** | Q3 (Output) | Kaki Anoda (+) LED 4 | LED Dekorasi 4 |
-| **7** | **GND** | Jalur utama GND ESP32 | Ground IC |
-| **8** | CLK (Clock) | Jalur menuju **GPIO 18** ESP32 | Sinyal Detak |
-| **9** | CLR (Clear) | Jalur menuju **5V / VIN** ESP32 | Mencegah auto-reset (Active Low) |
-| **10** | Q4 (Output) | Kaki Anoda (+) LED 5 | LED Dekorasi 5 |
-| **11** | Q5 (Output) | Kaki Anoda (+) LED 6 | LED Dekorasi 6 |
-| **12** | Q6 (Output) | Kaki Anoda (+) LED 7 | LED Dekorasi 7 |
-| **13** | Q7 (Output) | Kaki Anoda (+) LED 8 | LED Dekorasi 8 |
-| **14** | **VCC** | Jalur menuju **5V / VIN** ESP32 | Jalur daya utama IC (5V) |
-
-> ⚠️ **PANDUAN JALUR KATODA LED (SOLUSI 1 RESISTOR):**
-> Seluruh kaki Katoda (- / kaki pendek) dari LED 1 sampai LED 8 wajib disatukan menjadi satu jalur tembaga interkoneksi di PCB, lalu hubungkan ke salah satu kaki Resistor 1k Ohm. Kaki resistor yang satunya lagi ditarik langsung ke jalur GND ESP32.
-
----
-
-## 4. Arsitektur Sistem (High-Level)
+## 5. Arsitektur Sistem
 
 ```
-┌─────────────┐   publish/subscribe    ┌──────────────────────┐       publish/subscribe   ┌──────────────────────┐      WhatsApp Web       ┌──────────┐
-│   ESP32     │ ──────────────────────▶│   MQTT Broker Cloud  │◀──────────────────────────│  Node.js Gateway     │ ───────────────────────▶│  User    │
-│  Firmware   │◀────────────────────── │ (HiveMQ Cloud/EMQX)  │───────────────────────────▶│  (wwebjs.dev + PM2)  │◀─────────────────────── │  Phone   │
-└─────────────┘   MQTT over TLS (8883) └──────────────────────┘                            └──────────────────────┘
-      │
-      │ WiFiManager captive portal
-      ▼
-  Setup WiFi via HP saat pertama
-  kali nyala / tombol reset
+[ESP32 Smart Clock] <--MQTT(TLS)--> [Broker MQTT Lokal] <--MQTT--> [Bridge Node.js: wwebjs + MQTT client] <--WhatsApp Web protocol--> [WhatsApp User]
 ```
 
-* **ESP32** bertindak sebagai MQTT client: **subscribe** ke topic command (menerima perintah dari WhatsApp secara near-instant), dan **publish** ke topic status (melaporkan gas level, alarm state) secara periodik/event-based.
-* **MQTT Broker** (cloud, contoh: HiveMQ Cloud atau EMQX Cloud, tier gratis cukup untuk 1 device) bertindak sebagai perantara pesan. Baik ESP32 maupun Node.js Gateway sama-sama **outbound-only** ke broker ini — **tidak perlu Cloudflare Tunnel untuk ESP32**, karena ESP32 tidak menerima koneksi masuk dari mana pun.
-* **Node.js Gateway** bertindak sebagai jembatan antara WhatsApp dan MQTT: menerima pesan WhatsApp → publish command ke topic MQTT; subscribe topic status dari ESP32 → format balasan ke WhatsApp saat user `/status`.
-* **Cloudflare Tunnel** yang sudah ada sebelumnya (`alarm.fachrigaffar.web.id`) sekarang **opsional** — hanya diperlukan jika gateway Node.js butuh diakses dari luar untuk keperluan lain (misal dashboard web monitoring), bukan untuk komunikasi ESP32 lagi.
+### Komponen
 
----
+| Komponen | Fase 1 (Lokal) | Fase 2 (Cloud, nanti) |
+|---|---|---|
+| Broker MQTT | Mosquitto lokal di laptop (`localhost:8883` atau `1883` non-TLS untuk simplifikasi awal) | Broker cloud (HiveMQ Cloud, EMQX Cloud, atau self-hosted VPS) |
+| Bridge WhatsApp | Node.js + `whatsapp-web.js` + `mqtt` npm package, berjalan di laptop yang sama | Bisa tetap di laptop, atau dipindah ke VPS/server kecil (Raspberry Pi, VPS murah) |
+| Firmware ESP32 | Tidak berubah — cukup ganti `mqtt_host`/`mqtt_port` di WiFiManager config portal | Sama, tinggal ganti host lewat portal setup (tombol PB3 lama-tekan sudah tidak ada; gunakan menu Reset WiFi untuk masuk ulang ke portal) |
 
-## 5. Kebutuhan Perangkat Lunak & Jaringan
+Poin kunci desain: **firmware ESP32 tidak perlu tahu soal WhatsApp sama sekali.** Ia hanya bicara MQTT seperti sekarang. Semua logika WhatsApp ada di bridge Node.js, sehingga:
+- Mengganti broker lokal → cloud hanya soal konfigurasi ulang host MQTT di 2 tempat: ESP32 (via WiFiManager portal) dan bridge Node.js (`.env`).
+- Bridge bisa di-restart/di-deploy ulang tanpa mengganggu firmware.
 
-* **Firmware:** Arduino Framework (C++), disarankan pakai PlatformIO untuk manajemen dependency yang konsisten.
-* **Library WiFi Manager:** `tzapu/WiFiManager` (via captive portal AP mode). Menggantikan hardcoded `ssid`/`password` di kode lama.
-* **Library MQTT Client (BARU, menggantikan HTTP client):** `knolleary/PubSubClient` (ringan, umum dipakai) atau `AsyncMqttClient` (kalau butuh non-blocking penuh). Rekomendasi untuk skripsi: **PubSubClient**, karena lebih sederhana dijelaskan dan didukung banyak tutorial.
-* **Koneksi MQTT:** Menggunakan `WiFiClientSecure` sebagai underlying transport untuk PubSubClient agar koneksi ke broker terenkripsi TLS di port `8883` (bukan port `1883` yang plain text).
-* **MQTT Broker (cloud, pilih salah satu):**
-  - **HiveMQ Cloud** (free tier: 100 koneksi, cukup untuk 1 device + 1 gateway)
-  - **EMQX Cloud** (free tier serupa)
-  - Kedua broker mendukung TLS dan autentikasi username/password per client.
-* **WhatsApp Gateway:** Framework `wwebjs.dev` (Node.js) + library `mqtt` (npm package `mqtt`) sebagai MQTT client, dijalankan di bawah `PM2` agar tetap hidup saat terminal ditutup.
-* **Domain Endpoint (opsional, untuk dashboard/monitoring):** `https://alarm.fachrigaffar.web.id` via Cloudflare Tunnel — tidak lagi dipakai untuk komunikasi ESP32.
+## 6. Topik & Payload MQTT (Kontrak Existing — Referensi)
 
-### 5.1 Spesifikasi WiFiManager (Detail Implementasi)
+Firmware saat ini sudah mendukung topik berikut (device_id default: `esp32-clock-01`):
 
-* **Library:** `WiFiManager` by tzapu (install via Library Manager / PlatformIO `lib_deps`).
-* **Mode Trigger Setup:**
-  1. **Otomatis saat boot** jika tidak ada kredensial WiFi tersimpan atau gagal connect dalam `connectTimeout` (misal 10 detik) → device masuk **AP Mode** dengan SSID `SmartClock-Setup` (tanpa password, atau password default `12345678`).
-  2. **Manual reset** via long-press Push Button 3 (GPIO 14) ≥3 detik → panggil `wifiManager.resetSettings()` lalu restart ESP32.
-* **Portal Konfigurasi:** User connect ke AP `SmartClock-Setup` dari HP, browser otomatis diarahkan ke captive portal untuk memilih SSID rumah + masukkan password.
-* **Custom Parameter Tambahan (opsional, direkomendasikan):** Tambahkan field custom di WiFiManager untuk `device_id` atau `gateway_api_key` sehingga tidak perlu hardcode di firmware, dan bisa diganti bersamaan saat setup WiFi.
-* **Indikator OLED saat AP Mode:** Tampilkan teks di layar OLED seperti `"Setup WiFi: connect to SmartClock-Setup"` agar user tahu device sedang menunggu konfigurasi (bukan hang/rusak).
-* **Non-blocking requirement:** Selama AP mode aktif, fungsi alarm/buzzer/LED tetap boleh idle, tapi TIDAK boleh crash — pastikan `wifiManager.autoConnect()` dipanggil di `setup()` sebelum inisialisasi loop utama.
-
----
-
-## 6. Kontrak MQTT (WAJIB Konsisten Antara Firmware & Gateway)
-
-> Bagian ini penting agar AI assistant yang mengerjakan sisi C++ dan sisi Node.js menghasilkan topic & payload yang saling cocok. Sesuaikan/lengkapi field sesuai kebutuhan asli sebelum mulai coding, lalu JANGAN diubah sepihak di salah satu sisi tanpa update dokumen ini.
-
-### 6.1 Konvensi Topic
-
-Gunakan prefix per-device supaya scalable kalau nanti ada lebih dari 1 alat:
-
-| Topic | Arah | Publisher | Subscriber |
-| :--- | :--- | :--- | :--- |
-| `smartclock/{device_id}/status` | ESP32 → Gateway | ESP32 | Node.js Gateway |
-| `smartclock/{device_id}/command` | Gateway → ESP32 | Node.js Gateway | ESP32 |
-
-Contoh `device_id`: `esp32-clock-01` (disimpan sebagai custom parameter WiFiManager, lihat 5.1, sehingga tidak hardcode).
-
-### 6.2 ESP32 → Gateway: Publish Status
-
-**Topic:** `smartclock/esp32-clock-01/status`
-**QoS:** 1 (at-least-once, supaya tidak ada status yang hilang)
-**Retain:** `true` (agar gateway bisa langsung ambil status terakhir saat baru subscribe/reconnect)
-
+**Publish oleh device** → `smartclock/{device_id}/status` (retained):
 ```json
 {
   "device_id": "esp32-clock-01",
-  "gas_level": 812,
+  "gas_level": 123,
   "alarm_active": false,
-  "timestamp": 1720000000
+  "alarm_time": "06:00",
+  "pomodoro_running": false,
+  "online": true,
+  "timestamp": 1234567890
 }
 ```
+Dipublish tiap 30 detik (heartbeat) atau saat ada perubahan state (gas leak transition, alarm state transition).
 
-**Trigger publish:** setiap perubahan state penting (alarm nyala/mati, gas level naik signifikan) **dan** heartbeat berkala (misal tiap 30 detik) agar gateway tahu device masih online.
+**Subscribe oleh device** ← `smartclock/{device_id}/command`, payload JSON manual-parsed, mendukung key berikut:
+- `set_alarm_time`: `{"set_alarm_time":"06:30"}`
+- `clear_alarm`: `{"clear_alarm":true}`
+- `trigger_buzzer`: `{"trigger_buzzer":true}` / `false`
+- `start_pomodoro`: `{"start_pomodoro":25}` (angka = menit)
 
-### 6.3 Gateway → ESP32: Publish Command
+**LWT (Last Will):** `{"device_id":"...","online":false}` di topic status saat device disconnect tak terduga.
 
-**Topic:** `smartclock/esp32-clock-01/command`
-**QoS:** 1
-**Retain:** `false` (command sekali eksekusi, bukan state permanen)
+> Catatan: command MQTT saat ini di-parse manual (string search), bukan JSON library. Untuk fitur WhatsApp, bridge cukup mengirim payload JSON sesuai format di atas — tidak perlu mengubah firmware.
 
-```json
-{
-  "set_alarm_time": "06:30",
-  "trigger_buzzer": false,
-  "led_pattern": "idle"
-}
-```
+## 7. Requirement Fungsional — Bridge WhatsApp
 
-ESP32 **subscribe** ke topic ini di `setup()` (setelah WiFi & MQTT connect), lalu proses payload di MQTT callback function.
+### 7.1 Koneksi & Autentikasi
+- FR-1: Bridge menggunakan `whatsapp-web.js`, autentikasi via scan QR code sekali (disimpan session lokal via `LocalAuth` strategy agar tidak perlu scan ulang tiap restart).
+- FR-2: Bridge hanya merespons pesan dari nomor WhatsApp yang terdaftar di whitelist (`ALLOWED_NUMBERS` di config), untuk mencegah orang lain mengontrol perangkat.
 
-### 6.4 Last Will and Testament (LWT) — Deteksi Device Offline
+### 7.2 Command Parsing
+- FR-3: Bridge mendukung command berbasis teks natural sederhana (bukan harus command persis), contoh pola yang harus dikenali:
+  - `set alarm 06:00` / `set alarm jam 6 pagi` → publish `set_alarm_time`
+  - `hapus alarm` / `batal alarm` → publish `clear_alarm`
+  - `mulai pomodoro 25` / `pomodoro 25 menit` → publish `start_pomodoro`
+  - `stop pomodoro` / `batal pomodoro` → (perlu command MQTT baru, lihat §9)
+  - `status` / `cek status` → bridge membaca retained message terakhir di topic status dan membalas ringkasan
+  - `matikan alarm` / `silence` → publish `trigger_buzzer:false`
+- FR-4: Jika command tidak dikenali, bridge membalas pesan bantuan singkat berisi daftar command yang tersedia.
+- FR-5: Command matching bersifat case-insensitive dan toleran terhadap variasi kecil (mis. regex atau keyword matching, bukan exact match).
 
-Saat ESP32 connect ke broker, set LWT agar broker otomatis publish pesan berikut jika ESP32 terputus tiba-tiba (misal listrik mati/WiFi putus):
+### 7.3 Notifikasi Otomatis (Push dari Device → WhatsApp)
+- FR-6: Bridge subscribe ke topic status. Saat mendeteksi transisi state penting, kirim WhatsApp otomatis ke nomor terdaftar:
+  - `gas_level` melewati threshold (naik dari aman → bahaya) → "⚠️ Gas bocor terdeteksi! Level: {gas_level}"
+  - `alarm_active` berubah dari `false` → `true` → "⏰ Alarm berbunyi! ({alarm_time})"
+  - `pomodoro_running` berubah dari `true` → `false` tanpa dibatalkan manual (selesai natural) → "🍅 Pomodoro selesai! Waktunya istirahat."
+  - `online` berubah jadi `false` (device terputus / LWT triggered) → "🔌 Smart Clock terputus dari jaringan."
+- FR-7: Notifikasi tidak boleh spam — gunakan debounce/state-diff (bandingkan payload sebelumnya vs sekarang), bukan kirim tiap heartbeat 30 detik.
 
-**Topic:** `smartclock/esp32-clock-01/status`
-**Payload LWT:** `{"device_id": "esp32-clock-01", "online": false}`
-**Retain:** `true`
+### 7.4 Balasan Konfirmasi
+- FR-8: Setiap command yang berhasil dipublish ke MQTT dibalas konfirmasi ringkas ke WhatsApp (mis. "✅ Alarm diatur ke 06:00"). Bridge tidak menunggu ACK dari device (MQTT QoS di firmware saat ini adalah 1 untuk status, tapi command tidak ada ACK eksplisit) — cukup asumsikan berhasil terkirim, dan biarkan notifikasi status berikutnya (FR-6) yang mengonfirmasi hasil aktual di sisi device.
 
-Gateway subscribe topic ini juga untuk kasih tahu user via WhatsApp kalau device offline saat `/status` diminta.
+## 8. Requirement Non-Fungsional
 
-### 6.5 WhatsApp User → Gateway → Publish ke Topic Command
+- NFR-1 (Fase 1 — Lokal): Bridge boleh berjalan sebagai proses Node.js biasa di laptop (`node bridge.js` / dikelola PM2 untuk auto-restart). Tidak perlu HA (high availability) di fase ini.
+- NFR-2 (Keamanan): Kredensial MQTT dan whitelist nomor WhatsApp disimpan di `.env`, tidak di-hardcode / tidak di-commit ke repo publik.
+- NFR-3 (Portabilitas): Semua konfigurasi koneksi (host, port, TLS on/off, kredensial) harus lewat environment variable, bukan hardcoded, agar migrasi ke broker cloud di Fase 2 hanya butuh ubah `.env`.
+- NFR-4 (Observability): Bridge mencetak log ke console (dan idealnya ke file) untuk setiap command diterima, dipublish, dan notifikasi dikirim — untuk memudahkan debugging saat pengujian lokal.
+- NFR-5 (Resiliency): Bridge harus auto-reconnect ke broker MQTT jika koneksi putus (pola sama seperti `updateMQTT()` di firmware — retry berkala, bukan crash).
 
-Contoh perintah WhatsApp yang perlu di-parsing oleh gateway (`wwebjs.dev` message handler), lalu di-translate jadi publish MQTT ke topic 6.3:
-* `/alarm 06:30` → publish `{"set_alarm_time": "06:30"}`
-* `/status` → gateway baca retained message dari topic 6.2 (tidak perlu tanya ESP32 langsung), balas ringkasan ke WhatsApp
-* `/matikan` → publish `{"trigger_buzzer": false}`
+## 9. Perubahan yang Dibutuhkan di Firmware (Gap Analysis)
 
-### 6.6 Autentikasi & Keamanan
+Command MQTT yang **sudah ada** dan bisa langsung dipakai bridge tanpa ubah firmware:
+- `set_alarm_time`, `clear_alarm`, `trigger_buzzer`, `start_pomodoro`
 
-* Setiap client (ESP32 & Gateway) connect ke broker pakai **username/password terpisah** yang disediakan broker cloud (HiveMQ/EMQX), bukan API key custom buatan sendiri.
-* Koneksi wajib via **TLS port 8883**, bukan `1883` plain text.
-* Broker cloud modern (HiveMQ Cloud/EMQX Cloud) juga mendukung **ACL per client** — batasi ESP32 hanya boleh publish ke topic `status` dan subscribe ke topic `command` miliknya sendiri, tidak bisa akses topic device lain.
+Command yang **belum ada** dan perlu ditambahkan ke firmware agar paritas fitur dengan tombol fisik:
+- `stop_pomodoro` — untuk membatalkan pomodoro yang sedang berjalan dari WhatsApp (setara PB1 saat `MODE_POMODORO_RUNNING`)
+- (Opsional) `get_status` — trigger publish status on-demand, agar command "cek status" dari WhatsApp tidak bergantung pada retained message yang mungkin basi (stale) jika device baru online kembali
 
-> **Catatan:** Kalau kamu ganti provider broker atau ubah struktur topic, edit Bagian 6 ini dulu sebelum minta AI generate kode — supaya firmware dan gateway tetap sinkron.
+> Rekomendasi: tambahkan kedua command ini ke `mqttCallback()` di firmware sebelum development bridge dimulai, supaya bridge tidak perlu workaround.
 
----
+## 10. Fase & Milestone
 
-## 7. Instruksi Khusus untuk Pembuatan Jalur PCB (CNC Router)
+### Fase 1 — Lokal (Target: MVP)
+1. Setup Mosquitto broker lokal (non-TLS dulu untuk simplifikasi, port 1883) di laptop.
+2. Update `mqtt_host`/`mqtt_port` firmware via WiFiManager portal ke IP laptop.
+3. Build bridge Node.js: koneksi wwebjs (QR login) + koneksi MQTT client ke broker lokal.
+4. Implementasi command parsing dasar (§7.2) dan notifikasi otomatis (§7.3).
+5. Tambah `stop_pomodoro` (dan opsional `get_status`) ke firmware.
+6. Uji end-to-end: kirim command dari WhatsApp → device bereaksi → notifikasi balik.
 
-1. **Ketebalan Jalur (Trace Width):** Gunakan ketebalan minimal `0.6 mm` hingga `1.0 mm` untuk jalur daya (VCC 5V dan GND) karena memikul beban sensor gas MQ, buzzer, dan 8 LED. Jalur data logika bisa menggunakan ukuran standar `0.4 mm`.
-2. **Trace Clearance:** Berikan jarak aman (clearance) antar jalur tembaga minimal `0.5 mm` untuk mencegah short circuit akibat sisa serpihan tembaga saat proses *milling* oleh mata bor CNC Router.
-3. **Jumper Tembaga Terdekat:** Gabungkan Pad Pin 1 dan Pin 2 IC 74LS164 di layer bawah menggunakan trace terpendek sebelum ditarik keluar menuju GPIO 25. Lakukan hal sama untuk Pin 14 dan Pin 9 menuju suplai 5V.
+### Fase 2 — Migrasi ke MQTT Cloud/Online
+1. Pilih provider broker cloud (HiveMQ Cloud free tier / EMQX Cloud / self-hosted VPS + Mosquitto + TLS).
+2. Update `.env` bridge (host, port, kredensial, TLS on).
+3. Update `mqtt_host`/`mqtt_port`/`mqtt_user`/`mqtt_pass` di firmware via WiFiManager portal (field sudah tersedia di kode saat ini, tidak perlu ubah kode).
+4. (Opsional) Pindahkan proses bridge dari laptop ke server kecil (VPS/Raspberry Pi) agar selalu online 24/7, tidak tergantung laptop menyala.
+5. Uji ulang end-to-end dari luar jaringan lokal (mis. pakai data seluler di HP).
 
----
+## 11. Metrik Keberhasilan
 
-## 8. Struktur Kode yang Disarankan (untuk AI Code Assistant)
+- Command WhatsApp direspons device dalam < 3 detik (lokal) selama broker & bridge online.
+- Notifikasi gas bocor terkirim ke WhatsApp dalam < 5 detik sejak status berubah di device.
+- Tidak ada notifikasi duplikat/spam untuk satu kejadian yang sama (mis. gas bocor terus-menerus tidak mengirim notifikasi tiap 30 detik selama masih dalam kondisi bahaya yang sama).
 
-### 8.1 Firmware ESP32 (PlatformIO project layout)
+## 12. Risiko & Mitigasi
 
-```
-/src
-  main.cpp              # setup(), loop(), orchestrator
-  wifi_setup.cpp/.h      # wrapper WiFiManager (autoConnect, resetSettings, custom params: device_id, mqtt user/pass)
-  mqtt_client.cpp/.h     # koneksi PubSubClient + WiFiClientSecure (TLS 8883), subscribe command, publish status, LWT
-  display.cpp/.h         # OLED SSD1306 rendering (termasuk teks saat AP mode WiFiManager)
-  shift_register.cpp/.h  # kontrol 74LS164 (shiftOut ke GPIO 25 & 18)
-  alarm.cpp/.h           # logic buzzer + tombol
-  gas_sensor.cpp/.h      # baca GPIO 34, kalkulasi threshold
-platformio.ini            # tambahkan lib_deps: WiFiManager, PubSubClient
-```
+| Risiko | Mitigasi |
+|---|---|
+| Sesi WhatsApp Web (wwebjs) logout/expired sewaktu-waktu | Simpan session via `LocalAuth`, siapkan alert log saat sesi terputus agar user tahu perlu scan ulang QR |
+| `whatsapp-web.js` bergantung pada reverse-engineering WhatsApp Web (tidak resmi), berisiko diblokir/berubah sewaktu-waktu oleh WhatsApp | Terima sebagai risiko yang disadari untuk fase lokal/personal; evaluasi migrasi ke WhatsApp Business Cloud API resmi jika stabilitas jadi masalah di fase produksi |
+| Laptop mati/sleep membuat bridge & broker lokal offline | Diterima di Fase 1 sebagai batasan; diselesaikan di Fase 2 dengan hosting broker+bridge di server yang selalu nyala |
+| Nomor WhatsApp tak dikenal mengirim command (jika whitelist gagal) | Validasi whitelist di awal setiap message handler, sebelum parsing command apapun |
 
-### 8.2 Gateway Node.js (layout)
+## 13. Open Questions
 
-```
-/src
-  index.js              # entrypoint, PM2 ready
-  whatsapp/client.js     # inisialisasi wwebjs.dev client
-  whatsapp/commands.js   # parsing /alarm, /status, /matikan → publish ke MQTT
-  mqtt/client.js         # koneksi npm `mqtt` ke broker (TLS 8883), subscribe status, publish command
-  store/deviceState.js   # cache retained status terakhir per device_id (in-memory)
-.env                     # MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS, dll
-```
+1. Apakah bridge perlu mendukung lebih dari satu perangkat Smart Clock di masa depan (multi-device via `device_id` berbeda)? Jika ya, command WhatsApp perlu menyebutkan target device.
+2. Apakah notifikasi WhatsApp perlu dikirim ke grup, atau selalu ke chat personal admin?
+3. Apakah perlu rate-limit command dari WhatsApp (mis. mencegah spam "mulai pomodoro" berkali-kali dalam beberapa detik)?
+4. Untuk Fase 2, siapa yang akan menanggung biaya/maintenance broker cloud dan hosting bridge?
 
----
+## 14. Lampiran: Referensi Command WhatsApp → MQTT Payload
 
-## 9. Prioritas Pengerjaan (Checklist untuk Skripsi/UAS)
-
-- [ ] Setup akun broker MQTT cloud (HiveMQ Cloud/EMQX Cloud) + buat 2 client credential (ESP32 & Gateway)
-- [ ] Firmware: integrasi WiFiManager menggantikan hardcoded credentials
-- [ ] Firmware: integrasi PubSubClient (TLS 8883) — connect, subscribe topic command, publish topic status, setup LWT
-- [ ] Firmware: shift register 74LS164 untuk 8 LED
-- [ ] Firmware: baca sensor gas + trigger buzzer lokal
-- [ ] Gateway: setup wwebjs.dev + PM2
-- [ ] Gateway: integrasi npm `mqtt` — subscribe topic status, publish topic command sesuai kontrak Bagian 6
-- [ ] Gateway: command parser WhatsApp (/alarm, /status, /matikan)
-- [ ] Integrasi end-to-end test: WhatsApp → Gateway → MQTT Broker → ESP32 → Buzzer/LED
-- [ ] Test skenario offline: cabut power ESP32, pastikan LWT ter-trigger dan gateway lapor "device offline" saat `/status`
-- [ ] Dokumentasi PCB layout final untuk lampiran laporan
+| Perintah WhatsApp (contoh) | Topic MQTT | Payload |
+|---|---|---|
+| "set alarm 06:00" | `smartclock/{device_id}/command` | `{"set_alarm_time":"06:00"}` |
+| "hapus alarm" | `smartclock/{device_id}/command` | `{"clear_alarm":true}` |
+| "matikan alarm" | `smartclock/{device_id}/command` | `{"trigger_buzzer":false}` |
+| "mulai pomodoro 25" | `smartclock/{device_id}/command` | `{"start_pomodoro":25}` |
+| "stop pomodoro" *(butuh tambahan firmware)* | `smartclock/{device_id}/command` | `{"stop_pomodoro":true}` |
+| "cek status" | — (baca retained message dari `smartclock/{device_id}/status`, atau publish `{"get_status":true}` jika ditambahkan) | — |
