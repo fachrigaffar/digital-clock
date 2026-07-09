@@ -3,85 +3,156 @@ const mqttClient = require('../mqtt/client');
 
 const DEFAULT_DEVICE_ID = process.env.DEVICE_ID || 'esp32-clock-01';
 
+// FR-4: Help message displayed when command is not recognized
+const HELP_MESSAGE =
+  `📌 *Daftar Perintah Smart Clock:*\n\n` +
+  `• \`set alarm 06:00\` — Atur waktu alarm\n` +
+  `• \`hapus alarm\` / \`batal alarm\` — Hapus alarm yang sudah di-set\n` +
+  `• \`matikan alarm\` — Hentikan buzzer yang sedang berbunyi\n` +
+  `• \`mulai pomodoro 25\` — Mulai timer pomodoro (dalam menit)\n` +
+  `• \`stop pomodoro\` / \`batal pomodoro\` — Batalkan pomodoro yang berjalan\n` +
+  `• \`status\` / \`cek status\` — Lihat status gas, alarm, dan koneksi\n` +
+  `• \`bantuan\` / \`help\` — Tampilkan menu ini`;
+
+// FR-5: Time format extractor — supports "06:00", "6 pagi", "18:30", "jam 7 malam"
+function extractTime(text) {
+  // HH:MM format
+  const colonMatch = text.match(/(\d{1,2}):(\d{2})/);
+  if (colonMatch) {
+    const h = parseInt(colonMatch[1], 10);
+    const m = parseInt(colonMatch[2], 10);
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+      return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    }
+  }
+
+  // "6 pagi" / "7 malam" format
+  const wordMatch = text.match(/(\d{1,2})\s*(pagi|siang|sore|malam)/i);
+  if (wordMatch) {
+    let h = parseInt(wordMatch[1], 10);
+    const period = wordMatch[2].toLowerCase();
+    if (period === 'malam' || period === 'sore') {
+      if (h !== 12) h += 12;
+      if (h >= 24) h = 0;
+    } else if (period === 'pagi') {
+      if (h === 12) h = 0;
+    }
+    return `${String(h).padStart(2, '0')}:00`;
+  }
+
+  return null;
+}
+
+// FR-5: Minutes extractor for pomodoro
+function extractMinutes(text) {
+  const match = text.match(/(\d+)\s*(menit|min|m)?/i);
+  if (match) {
+    const val = parseInt(match[1], 10);
+    if (val > 0 && val <= 120) return val;
+  }
+  return null;
+}
+
 /**
- * Handles incoming WhatsApp commands.
- * @param {string} text The incoming message text
- * @returns {Promise<string|null>} The reply message, or null if not a command
+ * Handles incoming WhatsApp messages with natural language matching.
+ * FR-3, FR-5: Case-insensitive, regex/keyword based matching.
+ * @param {string} text
+ * @returns {Promise<string|null>}
  */
 async function handleCommand(text) {
-  if (!text || !text.startsWith('/')) {
-    return null;
+  if (!text || typeof text !== 'string') return null;
+
+  const normalized = text.trim().toLowerCase();
+
+  // FR-3: "status" / "cek status"
+  if (/^(status|cek\s*status|lihat\s*status)$/.test(normalized)) {
+    const state = deviceState.getState(DEFAULT_DEVICE_ID);
+    const onlineStatus = state.online ? '🟢 *Online*' : '🔴 *Offline*';
+    const alarmStatus = state.alarm_active ? `🚨 *Aktif* (${state.alarm_time || '-'})` : '⚪ Tidak Aktif';
+    const pomodoroStatus = state.pomodoro_running ? '🍅 *Berjalan*' : '⚪ Tidak Aktif';
+    const gasLabel = state.gas_level > (parseInt(process.env.GAS_THRESHOLD) || 400)
+      ? `⚠️ *${state.gas_level} (BAHAYA!)*`
+      : `✅ ${state.gas_level} (Aman)`;
+
+    let lastUpdateStr = 'Belum menerima data';
+    if (state.timestamp) {
+      const date = new Date(state.timestamp * 1000);
+      lastUpdateStr = date.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+    }
+
+    return `📊 *Status Smart Clock* — _${DEFAULT_DEVICE_ID}_\n\n` +
+           `• Koneksi  : ${onlineStatus}\n` +
+           `• Sensor Gas: ${gasLabel}\n` +
+           `• Alarm    : ${alarmStatus}\n` +
+           `• Pomodoro : ${pomodoroStatus}\n` +
+           `• Update   : ${lastUpdateStr}`;
   }
 
-  const tokens = text.trim().split(/\s+/);
-  const command = tokens[0].toLowerCase();
-  const args = tokens.slice(1);
-
-  switch (command) {
-    case '/alarm': {
-      if (args.length < 1) {
-        return 'Format salah. Gunakan: `/alarm HH:MM` (contoh: `/alarm 06:30`)';
-      }
-      const timeVal = args[0];
-      // Basic time regex validation (HH:MM)
-      const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
-      if (!timeRegex.test(timeVal)) {
-        return 'Format waktu tidak valid. Harap gunakan format HH:MM (contoh: 06:30)';
-      }
-
-      const success = mqttClient.publishCommand(DEFAULT_DEVICE_ID, {
-        set_alarm_time: timeVal
-      });
-
-      if (success) {
-        return `Berhasil mengatur alarm ke pukul *${timeVal}* untuk device *${DEFAULT_DEVICE_ID}*.`;
-      } else {
-        return 'Gagal mengirim perintah alarm ke broker MQTT. Pastikan server terhubung ke broker.';
-      }
+  // FR-3: "set alarm 06:00" / "set alarm jam 6 pagi"
+  if (/set\s+alarm/.test(normalized)) {
+    const time = extractTime(text);
+    if (!time) {
+      return 'Format waktu tidak dikenali. Contoh: "set alarm 06:30" atau "set alarm jam 6 pagi".';
     }
-
-    case '/matikan': {
-      const success = mqttClient.publishCommand(DEFAULT_DEVICE_ID, {
-        trigger_buzzer: false
-      });
-
-      if (success) {
-        return `Perintah mematikan alarm (buzzer) telah dikirim ke device *${DEFAULT_DEVICE_ID}*.`;
-      } else {
-        return 'Gagal mengirim perintah ke broker MQTT. Pastikan server terhubung ke broker.';
-      }
+    const success = mqttClient.publishCommand(DEFAULT_DEVICE_ID, { set_alarm_time: time });
+    if (success) {
+      console.log(`[CMD] set_alarm_time → ${time}`);
+      return `✅ Alarm diatur ke pukul *${time}*.`;
     }
-
-    case '/status': {
-      const state = deviceState.getState(DEFAULT_DEVICE_ID);
-      const onlineStatus = state.online ? '🟢 *Online*' : '🔴 *Offline*';
-      const alarmStatus = state.alarm_active ? '🚨 *Aktif (Buzzer Bunyi)*' : '⚪ Tidak Aktif';
-      
-      let lastUpdateStr = 'Belum menerima data';
-      if (state.timestamp) {
-        const date = new Date(state.timestamp * 1000);
-        lastUpdateStr = date.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
-      }
-
-      return `📊 *Status Device:* _${DEFAULT_DEVICE_ID}_\n\n` +
-             `• Koneksi: ${onlineStatus}\n` +
-             `• Sensor Gas: *${state.gas_level !== undefined ? state.gas_level : 'N/A'}*\n` +
-             `• Alarm State: ${alarmStatus}\n` +
-             `• Terakhir Diupdate: ${lastUpdateStr}`;
-    }
-
-    case '/help':
-    case '/menu': {
-      return `📌 *Daftar Perintah Bot WhatsApp:*\n\n` +
-             `• \`/status\` - Melihat status sensor gas, alarm, dan koneksi device.\n` +
-             `• \`/alarm HH:MM\` - Mengatur waktu alarm (contoh: \`/alarm 06:30\`).\n` +
-             `• \`/matikan\` - Mematikan alarm/buzzer secara manual.\n` +
-             `• \`/help\` - Menampilkan menu bantuan ini.`;
-    }
-
-    default:
-      return `Perintah tidak dikenal. Ketik \`/help\` untuk melihat daftar perintah.`;
+    return '❌ Gagal mengirim perintah ke broker MQTT.';
   }
+
+  // FR-3: "hapus alarm" / "batal alarm" / "cancel alarm"
+  if (/^(hapus|batal|cancel)\s*alarm/.test(normalized)) {
+    const success = mqttClient.publishCommand(DEFAULT_DEVICE_ID, { clear_alarm: true });
+    if (success) {
+      console.log('[CMD] clear_alarm → true');
+      return '✅ Alarm telah dihapus.';
+    }
+    return '❌ Gagal mengirim perintah ke broker MQTT.';
+  }
+
+  // FR-3: "matikan alarm" / "silence" / "stop alarm"
+  if (/^(matikan|silence|diam|stop)\s*alarm/.test(normalized) || normalized === 'matikan' || normalized === 'silence') {
+    const success = mqttClient.publishCommand(DEFAULT_DEVICE_ID, { trigger_buzzer: false });
+    if (success) {
+      console.log('[CMD] trigger_buzzer → false');
+      return '✅ Alarm/buzzer dimatikan.';
+    }
+    return '❌ Gagal mengirim perintah ke broker MQTT.';
+  }
+
+  // FR-3: "mulai pomodoro 25" / "pomodoro 25 menit" / "start pomodoro 25"
+  if (/(mulai|start|pomodoro)\s*(pomodoro)?/.test(normalized) && /\d+/.test(normalized)) {
+    const minutes = extractMinutes(text);
+    if (!minutes) {
+      return 'Format tidak dikenali. Contoh: "mulai pomodoro 25" atau "pomodoro 25 menit".';
+    }
+    const success = mqttClient.publishCommand(DEFAULT_DEVICE_ID, { start_pomodoro: minutes });
+    if (success) {
+      console.log(`[CMD] start_pomodoro → ${minutes} menit`);
+      return `✅ Timer Pomodoro dimulai selama *${minutes} menit*. 🍅`;
+    }
+    return '❌ Gagal mengirim perintah ke broker MQTT.';
+  }
+
+  // FR-3: "stop pomodoro" / "batal pomodoro" / "cancel pomodoro"
+  if (/(stop|batal|cancel)\s*pomodoro/.test(normalized)) {
+    const success = mqttClient.publishCommand(DEFAULT_DEVICE_ID, { stop_pomodoro: true });
+    if (success) {
+      console.log('[CMD] stop_pomodoro → true');
+      return '✅ Pomodoro dibatalkan.';
+    }
+    return '❌ Gagal mengirim perintah ke broker MQTT.';
+  }
+
+  // FR-3: "bantuan" / "help" / "menu"
+  if (/^(bantuan|help|menu|\?|tolong)$/.test(normalized)) {
+    return HELP_MESSAGE;
+  }
+
+  // FR-4: Unknown command — reply with help
+  return HELP_MESSAGE;
 }
 
 module.exports = {
