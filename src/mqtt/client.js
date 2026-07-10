@@ -61,6 +61,11 @@ function init() {
         timestamp: payload.timestamp || Math.floor(Date.now() / 1000)
       });
 
+      // Log gas reading for chart data
+      if (typeof payload.gas_level === 'number') {
+        db.logGasReading(deviceId, payload.gas_level);
+      }
+
       // FR-6: Detect state transitions and push WhatsApp notifications
       handleStateTransitions(deviceId, prev, deviceState.getState(deviceId));
 

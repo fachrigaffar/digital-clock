@@ -106,7 +106,7 @@ async function init() {
       console.log(`[MSG] Dari ${senderId}: ${text}`);
 
       try {
-        const reply = await commands.handleCommand(text);
+        const reply = await commands.handleCommand(text, senderId);
         if (reply) {
           await sock.sendMessage(senderId, { text: reply });
         }
@@ -136,8 +136,25 @@ async function sendNotification(message) {
   }
 }
 
+/**
+ * Kirim gambar (buffer PNG) ke JID tertentu.
+ * @param {string} jid - WhatsApp JID penerima
+ * @param {Buffer} imageBuffer
+ * @param {string} caption
+ */
+async function sendImage(jid, imageBuffer, caption = '') {
+  if (!sock) return;
+  try {
+    await sock.sendMessage(jid, { image: imageBuffer, caption });
+    console.log(`[NOTIFY] Gambar terkirim ke ${jid}`);
+  } catch (err) {
+    console.error('[ERROR] Gagal kirim gambar:', err.message);
+  }
+}
+
 module.exports = {
   init,
   sendNotification,
+  sendImage,
   getClient: () => sock
 };

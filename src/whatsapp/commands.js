@@ -1,5 +1,6 @@
 const deviceState = require('../store/deviceState');
 const db = require('../store/db');
+const { generateGasChart } = require('../chart/gasChart');
 
 const DEFAULT_DEVICE_ID = process.env.DEVICE_ID || 'esp32-clock-01';
 
@@ -13,6 +14,7 @@ const HELP_MESSAGE =
   `• \`stop pomodoro\` / \`batal pomodoro\` — Batalkan pomodoro yang berjalan\n` +
   `• \`status\` / \`cek status\` — Lihat status gas, alarm, dan koneksi\n` +
   `• \`riwayat\` / \`history\` — Lihat 10 riwayat alarm & gas terakhir\n` +
+  `• \`grafik\` / \`grafik gas\` — Kirim grafik level gas (30 data terakhir)\n` +
   `• \`bantuan\` / \`help\` — Tampilkan menu ini`;
 
 // FR-5: Time format extractor — supports "06:00", "6 pagi", "18:30", "jam 7 malam"
@@ -60,7 +62,7 @@ function extractMinutes(text) {
  * @param {string} text
  * @returns {Promise<string|null>}
  */
-async function handleCommand(text) {
+async function handleCommand(text, senderId = null) {
   if (!text || typeof text !== 'string') return null;
 
   // Lazy require to avoid circular dependency (mqtt/client → whatsapp/client → commands → mqtt/client)
@@ -168,6 +170,20 @@ async function handleCommand(text) {
       return `${i + 1}. ${icon} *${e.event_type.toUpperCase()}* — ${e.detail}\n    🕐 ${time}`;
     });
     return `📋 *10 Riwayat Terakhir:*\n\n${lines.join('\n\n')}`;
+  }
+
+  // Grafik level gas
+  if (/^(grafik|grafik\s*gas|send\s*grafik|chart\s*gas)$/.test(normalized)) {
+    if (!senderId) return '❌ Tidak bisa mengirim grafik.';
+    const readings = await db.getRecentGasReadings(DEFAULT_DEVICE_ID, 30);
+    if (!readings || readings.length === 0) {
+      return '📭 Belum ada data gas yang tercatat. Tunggu beberapa menit agar sensor mengirim data.';
+    }
+    const imageBuffer = await generateGasChart(readings);
+    // Lazy require to avoid circular dependency
+    const whatsappClient = require('./client');
+    await whatsappClient.sendImage(senderId, imageBuffer, `📊 Grafik Level Gas — ${DEFAULT_DEVICE_ID}\n🕑 ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`);
+    return null; // gambar sudah dikirim langsung, tidak perlu reply teks
   }
 
   // FR-4: Unknown command — reply with help
