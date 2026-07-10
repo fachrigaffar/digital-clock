@@ -1,6 +1,7 @@
 const mqtt = require('mqtt');
 const deviceState = require('../store/deviceState');
 const whatsappClient = require('../whatsapp/client');
+const db = require('../store/db');
 
 const GAS_THRESHOLD = parseInt(process.env.GAS_THRESHOLD || '400', 10);
 
@@ -97,6 +98,7 @@ function handleStateTransitions(deviceId, prev, curr) {
     const msg = `⚠️ *Gas bocor terdeteksi!*\nDevice: _${deviceId}_\nLevel gas: *${curr.gas_level}* (ambang batas: ${GAS_THRESHOLD})\nHarap segera periksa!`;
     console.log(`[NOTIFY] Gas danger transition detected for ${deviceId}`);
     whatsappClient.sendNotification(msg);
+    db.logEvent(deviceId, 'gas', `Level gas: ${curr.gas_level}`);
   }
 
   // Alarm: false → true transition only
@@ -105,6 +107,7 @@ function handleStateTransitions(deviceId, prev, curr) {
     const msg = `⏰ *Alarm berbunyi!*${timeLabel}\nDevice: _${deviceId}_`;
     console.log(`[NOTIFY] Alarm activated for ${deviceId}`);
     whatsappClient.sendNotification(msg);
+    db.logEvent(deviceId, 'alarm', `Alarm berbunyi${timeLabel}`);
   }
 
   // Pomodoro: running → stopped (natural finish — user did NOT cancel manually)

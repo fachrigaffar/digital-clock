@@ -1010,6 +1010,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       if (secondQuote != -1) {
         String alarmTimeVal = message.substring(firstQuote + 1, secondQuote);
         setAlarmTime(alarmTimeVal);
+        publishStatus(readGasLevel(), isAlarmActive);
         Serial.print("MQTT set alarm: ");
         Serial.println(alarmTimeVal);
       }

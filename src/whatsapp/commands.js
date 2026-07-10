@@ -1,5 +1,5 @@
 const deviceState = require('../store/deviceState');
-const mqttClient = require('../mqtt/client');
+const db = require('../store/db');
 
 const DEFAULT_DEVICE_ID = process.env.DEVICE_ID || 'esp32-clock-01';
 
@@ -12,6 +12,7 @@ const HELP_MESSAGE =
   `• \`mulai pomodoro 25\` — Mulai timer pomodoro (dalam menit)\n` +
   `• \`stop pomodoro\` / \`batal pomodoro\` — Batalkan pomodoro yang berjalan\n` +
   `• \`status\` / \`cek status\` — Lihat status gas, alarm, dan koneksi\n` +
+  `• \`riwayat\` / \`history\` — Lihat 10 riwayat alarm & gas terakhir\n` +
   `• \`bantuan\` / \`help\` — Tampilkan menu ini`;
 
 // FR-5: Time format extractor — supports "06:00", "6 pagi", "18:30", "jam 7 malam"
@@ -62,6 +63,9 @@ function extractMinutes(text) {
 async function handleCommand(text) {
   if (!text || typeof text !== 'string') return null;
 
+  // Lazy require to avoid circular dependency (mqtt/client → whatsapp/client → commands → mqtt/client)
+  const mqttClient = require('../mqtt/client');
+
   const normalized = text.trim().toLowerCase();
 
   // FR-3: "status" / "cek status"
@@ -97,6 +101,7 @@ async function handleCommand(text) {
     const success = mqttClient.publishCommand(DEFAULT_DEVICE_ID, { set_alarm_time: time });
     if (success) {
       console.log(`[CMD] set_alarm_time → ${time}`);
+      db.logEvent(DEFAULT_DEVICE_ID, 'alarm', `Alarm di-set ke ${time}`);
       return `✅ Alarm diatur ke pukul *${time}*.`;
     }
     return '❌ Gagal mengirim perintah ke broker MQTT.';
@@ -149,6 +154,20 @@ async function handleCommand(text) {
   // FR-3: "bantuan" / "help" / "menu"
   if (/^(bantuan|help|menu|\?|tolong)$/.test(normalized)) {
     return HELP_MESSAGE;
+  }
+
+  // Riwayat alarm & gas dari database
+  if (/^(riwayat|history|log)$/.test(normalized)) {
+    const events = await db.getRecentEvents(10);
+    if (!events || events.length === 0) {
+      return '📭 Belum ada riwayat alarm atau gas yang tercatat.';
+    }
+    const lines = events.map((e, i) => {
+      const icon = e.event_type === 'alarm' ? '⏰' : '⚠️';
+      const time = new Date(e.created_at).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+      return `${i + 1}. ${icon} *${e.event_type.toUpperCase()}* — ${e.detail}\n    🕐 ${time}`;
+    });
+    return `📋 *10 Riwayat Terakhir:*\n\n${lines.join('\n\n')}`;
   }
 
   // FR-4: Unknown command — reply with help

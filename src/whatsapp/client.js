@@ -1,113 +1,143 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const commands = require('./commands');
 
-let client = null;
+let sock = null;
 
-// FR-2: Whitelist of allowed numbers. Stored in .env as comma-separated string.
-// Format: international format without '+', e.g. "6281234567890,6289876543210"
+// FR-2: Whitelist — format internasional tanpa '+' (mis. 6281234567890)
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
   ? process.env.ALLOWED_NUMBERS.split(',').map(n => n.trim())
   : [];
 
-/**
- * Checks if a sender is allowed to issue commands.
- * If ALLOWED_NUMBERS is empty, all senders are allowed (development mode).
- */
-function isAllowed(senderId) {
+function isAllowed(jid) {
   if (ALLOWED_NUMBERS.length === 0) {
-    console.warn('[WARN] ALLOWED_NUMBERS not set — accepting commands from everyone. Set it in .env to restrict access.');
+    console.warn('[WARN] ALLOWED_NUMBERS tidak di-set — semua pengirim diterima (mode development).');
     return true;
   }
-  // senderId from wwebjs is in format "628xxx@c.us"
-  const number = senderId.replace('@c.us', '').replace('@s.whatsapp.net', '');
+  // Baileys JID format: "6281234567890@s.whatsapp.net"
+  const number = jid.split('@')[0];
   return ALLOWED_NUMBERS.includes(number);
 }
 
-function init() {
-  console.log('Initializing WhatsApp Client...');
+async function init() {
+  console.log('Initializing WhatsApp Client (Baileys — no browser needed)...');
 
   if (ALLOWED_NUMBERS.length > 0) {
-    console.log(`[INFO] Whitelist active — allowed numbers: ${ALLOWED_NUMBERS.join(', ')}`);
+    console.log(`[INFO] Whitelist aktif — nomor diizinkan: ${ALLOWED_NUMBERS.join(', ')}`);
   }
 
-  const puppeteerOptions = {
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  };
+  // Simpan session auth di folder .baileys_auth/ agar tidak perlu scan ulang tiap restart
+  const { state, saveCreds } = await useMultiFileAuthState('.baileys_auth');
+  const { version } = await fetchLatestBaileysVersion();
 
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    console.log(`[INFO] Using custom Puppeteer executable: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
-    puppeteerOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
+  console.log(`[INFO] Menggunakan WhatsApp Web versi: ${version.join('.')}`);
 
-  // FR-1: Use LocalAuth to persist session — no re-scan after restart
-  client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: puppeteerOptions
-  });
-
-  client.on('qr', (qr) => {
-    console.log('\n--- SCAN QR CODE INI DENGAN WHATSAPP ---');
-    qrcode.generate(qr, { small: true });
-    console.log('----------------------------------------\n');
-  });
-
-  client.on('ready', () => {
-    console.log('[INFO] WhatsApp Client siap dan terautentikasi!');
-  });
-
-  client.on('message', async (msg) => {
-    // FR-2: Validate sender against whitelist before parsing any command
-    if (!isAllowed(msg.from)) {
-      console.log(`[BLOCKED] Message from unauthorized number: ${msg.from}`);
-      return;
+  sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false, // kita handle QR sendiri pakai qrcode-terminal
+    logger: {
+      // Pino-compatible silent logger — Baileys wajib butuh child() method
+      level: 'silent',
+      trace: () => {}, debug: () => {}, info: () => {},
+      warn: () => {}, error: (msg) => console.error('[BAILEYS]', msg),
+      fatal: () => {}, child() { return this; }
     }
-    try {
-      console.log(`[MSG] From ${msg.from}: ${msg.body}`);
-      const reply = await commands.handleCommand(msg.body);
-      if (reply) {
-        await msg.reply(reply);
+  });
+
+  // Event: connection update (QR code, connected, disconnected)
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log('\n--- SCAN QR CODE INI DENGAN WHATSAPP ---');
+      qrcode.generate(qr, { small: true });
+      console.log('----------------------------------------\n');
+    }
+
+    if (connection === 'open') {
+      console.log('[INFO] WhatsApp Client siap dan terautentikasi!');
+    }
+
+    if (connection === 'close') {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+
+      if (shouldReconnect) {
+        console.log('[WARN] Koneksi WhatsApp terputus, mencoba reconnect...');
+        init(); // rekursif reconnect
+      } else {
+        console.log('[WARN] WhatsApp logout — hapus folder .baileys_auth/ dan jalankan ulang untuk scan QR baru.');
       }
-    } catch (err) {
-      console.error('[ERROR] Error handling message:', err);
     }
   });
 
-  client.on('auth_failure', (msg) => {
-    console.error('[ERROR] WhatsApp authentication failure:', msg);
-  });
+  // Event: simpan credentials tiap kali diperbarui
+  sock.ev.on('creds.update', saveCreds);
 
-  client.on('disconnected', (reason) => {
-    console.log('[WARN] WhatsApp Client disconnected:', reason);
-  });
+  // Event: pesan masuk
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
 
-  client.initialize().catch((err) => {
-    console.error('[ERROR] Failed to initialize WhatsApp client:', err);
+    for (const msg of messages) {
+      // Abaikan pesan dari diri sendiri dan pesan status broadcast
+      if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+
+      const senderId = msg.key.remoteJid;
+
+      // FR-2: validasi whitelist sebelum parsing command apapun
+      if (!isAllowed(senderId)) {
+        console.log(`[BLOCKED] Pesan dari nomor tidak diizinkan: ${senderId}`);
+        continue;
+      }
+
+      const text =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        '';
+
+      if (!text) continue;
+
+      console.log(`[MSG] Dari ${senderId}: ${text}`);
+
+      try {
+        const reply = await commands.handleCommand(text);
+        if (reply) {
+          await sock.sendMessage(senderId, { text: reply });
+        }
+      } catch (err) {
+        console.error('[ERROR] Gagal memproses pesan:', err.message);
+      }
+    }
   });
 }
 
 /**
- * Sends a message to the first allowed number as a push notification.
+ * Kirim notifikasi push ke nomor pertama di whitelist.
  * @param {string} message
  */
 async function sendNotification(message) {
-  if (!client) return;
+  if (!sock) return;
   if (ALLOWED_NUMBERS.length === 0) {
-    console.warn('[WARN] Cannot send push notification — ALLOWED_NUMBERS is not set in .env');
+    console.warn('[WARN] Tidak bisa kirim notifikasi — ALLOWED_NUMBERS tidak di-set.');
     return;
   }
-  const target = `${ALLOWED_NUMBERS[0]}@c.us`;
+  const target = `${ALLOWED_NUMBERS[0]}@s.whatsapp.net`;
   try {
-    await client.sendMessage(target, message);
-    console.log(`[NOTIFY] Sent to ${target}: ${message}`);
+    await sock.sendMessage(target, { text: message });
+    console.log(`[NOTIFY] Terkirim ke ${target}: ${message}`);
   } catch (err) {
-    console.error('[ERROR] Failed to send notification:', err.message);
+    console.error('[ERROR] Gagal kirim notifikasi:', err.message);
   }
 }
 
 module.exports = {
   init,
   sendNotification,
-  getClient: () => client
+  getClient: () => sock
 };
